@@ -3,8 +3,7 @@
 
 import uModBusFunctions as functions
 import uModBusConst as Const
-from machine import UART
-from machine import Pin
+from machine import UART, Pin, mem32
 import struct
 import time
 import machine
@@ -15,16 +14,25 @@ class uModBusSerial:
         pinsLen=len(pins)
         if pins==None or pinsLen<2 or pinsLen>4 or pinsLen==3:
             raise ValueError('pins should contain pin names/numbers for: tx, rx, [rts, cts]')
+        
+        # need to read registers to get tx fifo empty
+        if uart_id == 0:
+            self.uart_base = 0x40034000
+        else:
+            self.uart_base = 0x40038000
+            
+        self.char_timeout = (25000 // baudrate) + 10
+            
         tx=pins[0]
         rx=pins[1]
         if pinsLen==4:
             rts=pins[2]
             cts=pins[3]
             self._uart = UART(uart_id, baudrate=baudrate, bits=data_bits, parity=parity, \
-                          stop=stop_bits, timeout_char=10, tx=tx, rx=rx, rts=rts, cts=cts)
+                          stop=stop_bits, tx=tx, rx=rx, rts=rts, cts=cts)
         else:
             self._uart = UART(uart_id, baudrate=baudrate, bits=data_bits, parity=parity, \
-                            stop=stop_bits, timeout_char=10, tx=tx, rx=rx)
+                            stop=stop_bits,tx=tx, rx=rx)
         #self._uart = UART(uart_id, baudrate=baudrate, bits=data_bits, parity=parity, \
         #                  stop=stop_bits, timeout_chars=10, pins=pins)
         if ctrl_pin is not None:
@@ -32,6 +40,27 @@ class uModBusSerial:
         else:
             self._ctrlPin = None
         self.char_time_ms = (1000 * (data_bits + stop_bits + 2)) // baudrate
+        
+    # function added because UART library is not completed
+    def wait_tx_done(self, value):
+        # check register to figure out if output uart tx is done
+        # check buzy flag
+        while (mem32[self.uart_base + 0x18] & 8) ==8 :
+            pass
+        return True
+    
+    def read_timeOut(self):
+        now = time.ticks_ms()
+        value = b''
+        while True:
+            if  (time.ticks_ms() - now) > self.char_timeout:
+                break
+            if self._uart.any():
+                value = value + self._uart.read(1)
+                now = time.ticks_ms()
+        return value
+    
+        
 
     def _calculate_crc16(self, data):
         crc = 0xFFFF
@@ -72,7 +101,7 @@ class uModBusSerial:
 
         for x in range(1, 40):
             if self._uart.any():
-                response.extend(self._uart.read())
+                response.extend(self.read_timeOut())
                 #response.extend(self._uart.readall())
                 # variable length function codes may require multiple reads
                 if self._exit_read(response):
@@ -90,17 +119,17 @@ class uModBusSerial:
         serial_pdu.extend(crc)
 
         # flush the Rx FIFO
-        self._uart.read()
+        self.read_timeOut()
         if self._ctrlPin:
             self._ctrlPin(1)
         self._uart.write(serial_pdu)
         if self._ctrlPin:
-            while not self._uart.wait_tx_done(2):
+            while not self.wait_tx_done(2):
                 machine.idle()
             time.sleep_ms(1 + self.char_time_ms)
             self._ctrlPin(0)
 
-        return self._validate_resp_hdr(self._uart_read(), slave_addr, modbus_pdu[0], count)
+        return self._validate_resp_hdr(self.read_timeOut(), slave_addr, modbus_pdu[0], count)
 
     def _validate_resp_hdr(self, response, slave_addr, function_code, count):
 
